@@ -14,6 +14,9 @@ const userInput = document.getElementById('user-input');
 const messagesContainer = document.getElementById('messages');
 const statusDiv = document.getElementById('status');
 const statusText = document.getElementById('status-text');
+const sidebarToggle = document.getElementById('sidebar-toggle');
+const sidebar = document.getElementById('sidebar');
+const sendButton = document.getElementById('send-button');
 
 // State
 let conversationId = generateId();
@@ -25,6 +28,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadModels();
     setupEventListeners();
     adjustTextareaHeight();
+    setupMobileMenu();
 });
 
 /**
@@ -92,7 +96,10 @@ function setupEventListeners() {
     chatForm.addEventListener('submit', handleSubmit);
     
     // Auto-resize textarea
-    userInput.addEventListener('input', adjustTextareaHeight);
+    userInput.addEventListener('input', () => {
+        adjustTextareaHeight();
+        updateSendButtonState();
+    });
     
     // Streaming toggle
     if (streamingToggle) {
@@ -106,6 +113,16 @@ function setupEventListeners() {
             streamingToggle.checked = savedPreference === 'true';
         }
     }
+    
+    // Enter key handling for textarea
+    userInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (!isProcessing && userInput.value.trim()) {
+                handleSubmit(e);
+            }
+        }
+    });
 }
 
 /**
@@ -114,18 +131,23 @@ function setupEventListeners() {
 function startNewChat() {
     conversationId = generateId();
     
-    // Clear messages except the welcome message
+    // Clear messages and show welcome message
     messagesContainer.innerHTML = `
-        <div class="message system">
-            <div class="message-content">
-                <p>Welcome to Ollama Chainlet! Select a model and start chatting.</p>
+        <div class="welcome-message">
+            <div class="welcome-content">
+                <h1>How can I help you today?</h1>
+                <p>Choose a model from the sidebar and start chatting.</p>
             </div>
         </div>
     `;
     
+    // Remove has-messages class to show welcome message
+    messagesContainer.classList.remove('has-messages');
+    
     // Clear the input
     userInput.value = '';
     adjustTextareaHeight();
+    updateSendButtonState();
     
     // Clear the conversation on the server
     fetch(`/api/conversations/${conversationId}`, {
@@ -152,12 +174,14 @@ async function handleSubmit(event) {
         return;
     }
     
-    // Add user message to the UI
+    // Hide welcome message and add user message to the UI
+    messagesContainer.classList.add('has-messages');
     addMessage(message, 'user');
     
     // Clear the input
     userInput.value = '';
     adjustTextareaHeight();
+    updateSendButtonState();
     
     // Show processing indicator
     isProcessing = true;
@@ -186,6 +210,7 @@ async function handleSubmit(event) {
         addMessage('Error: Unable to generate a response. Please try again.', 'system');
     } finally {
         isProcessing = false;
+        updateSendButtonState();
     }
 }
 
@@ -231,6 +256,12 @@ async function handleStreamingResponse(message, selectedModel) {
     // Create an empty message div for streaming content
     currentMessageDiv = document.createElement('div');
     currentMessageDiv.className = 'message assistant';
+    
+    // Add avatar
+    const avatarDiv = document.createElement('div');
+    avatarDiv.className = 'message-avatar';
+    avatarDiv.textContent = 'AI';
+    currentMessageDiv.appendChild(avatarDiv);
     
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
@@ -351,6 +382,14 @@ function addMessage(content, role) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
     
+    // Add avatar for user and assistant messages
+    if (role === 'user' || role === 'assistant') {
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = 'message-avatar';
+        avatarDiv.textContent = role === 'user' ? 'U' : 'AI';
+        messageDiv.appendChild(avatarDiv);
+    }
+    
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
     
@@ -369,13 +408,24 @@ function addMessage(content, role) {
  */
 function addLoadingMessage() {
     const loadingDiv = document.createElement('div');
-    loadingDiv.className = 'message assistant loading-message';
-    loadingDiv.innerHTML = `
-        <div class="message-content">
-            <div class="loading"></div>
-            <span class="ms-2">Generating response...</span>
-        </div>
+    loadingDiv.className = 'loading-message';
+    
+    // Add avatar
+    const avatarDiv = document.createElement('div');
+    avatarDiv.className = 'message-avatar';
+    avatarDiv.textContent = 'AI';
+    loadingDiv.appendChild(avatarDiv);
+    
+    // Add loading indicator
+    const loadingIndicator = document.createElement('div');
+    loadingIndicator.className = 'loading-indicator';
+    loadingIndicator.innerHTML = `
+        <div class="loading-dot"></div>
+        <div class="loading-dot"></div>
+        <div class="loading-dot"></div>
     `;
+    loadingDiv.appendChild(loadingIndicator);
+    
     messagesContainer.appendChild(loadingDiv);
     
     // Scroll to bottom
@@ -427,4 +477,48 @@ function adjustTextareaHeight() {
  */
 function generateId() {
     return Math.random().toString(36).substring(2, 15);
+}
+
+/**
+ * Update send button state based on input and processing state
+ */
+function updateSendButtonState() {
+    const hasText = userInput.value.trim().length > 0;
+    const shouldEnable = hasText && !isProcessing;
+    
+    sendButton.disabled = !shouldEnable;
+    
+    if (isProcessing) {
+        sendButton.classList.add('loading');
+    } else {
+        sendButton.classList.remove('loading');
+    }
+}
+
+/**
+ * Setup mobile menu functionality
+ */
+function setupMobileMenu() {
+    if (sidebarToggle && sidebar) {
+        sidebarToggle.addEventListener('click', () => {
+            sidebar.classList.toggle('open');
+        });
+        
+        // Close sidebar when clicking outside on mobile
+        document.addEventListener('click', (e) => {
+            if (window.innerWidth <= 768 && 
+                sidebar.classList.contains('open') &&
+                !sidebar.contains(e.target) && 
+                !sidebarToggle.contains(e.target)) {
+                sidebar.classList.remove('open');
+            }
+        });
+        
+        // Close sidebar on window resize to desktop
+        window.addEventListener('resize', () => {
+            if (window.innerWidth > 768) {
+                sidebar.classList.remove('open');
+            }
+        });
+    }
 }
