@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "example-server": {
+      "command": "uv",
+      "args": ["run", "server", "fastmcp_quickstart", "stdio"],
+      "env": {}
+    }
+  }
+}
