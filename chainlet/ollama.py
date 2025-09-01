@@ -4,9 +4,8 @@ Ollama Chainlet Implementation
 This module provides a chainlet implementation for interacting with Ollama models.
 """
 
-import json
-import requests
-from typing import List, Dict, Any, Optional, Tuple, Generator, Iterator
+import ollama
+from typing import List, Dict, Any, Optional, Iterator
 
 from .core import Chainlet, Message, Role
 
@@ -41,7 +40,7 @@ class OllamaChainlet(Chainlet):
             max_tokens (int, optional): The maximum number of tokens to generate.
         """
         super().__init__(system_prompt)
-        self.base_url = base_url.rstrip("/")
+        self.client = ollama.Client(host=base_url)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -62,36 +61,22 @@ class OllamaChainlet(Chainlet):
         if user_message:
             self.add_user_message(user_message)
         
-        # Prepare the request payload
-        payload = {
-            "model": self.model,
-            "messages": self.get_messages_as_dicts(),
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens
-            },
-            "stream": False
-        }
-        
-        # Send the request to the Ollama API
         try:
-            response = requests.post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-                headers={"Content-Type": "application/json"}
+            response = self.client.chat(
+                model=self.model,
+                messages=self.get_messages_as_dicts(),
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": self.max_tokens
+                }
             )
-            response.raise_for_status()
             
-            # Parse the response
-            result = response.json()
-            assistant_message = result.get("message", {}).get("content", "")
-            
-            # Add the assistant's response to the conversation history
+            assistant_message = response['message']['content']
             self.add_assistant_message(assistant_message)
             
             return assistant_message
-        
-        except requests.exceptions.RequestException as e:
+            
+        except ollama.ResponseError as e:
             error_message = f"Error communicating with Ollama API: {str(e)}"
             raise Exception(error_message)
     
@@ -111,45 +96,27 @@ class OllamaChainlet(Chainlet):
         if user_message:
             self.add_user_message(user_message)
         
-        # Prepare the request payload
-        payload = {
-            "model": self.model,
-            "messages": self.get_messages_as_dicts(),
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens
-            },
-            "stream": True
-        }
-        
-        # Send the request to the Ollama API
         try:
             full_response = ""
-            with requests.post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-                headers={"Content-Type": "application/json"},
+            stream = self.client.chat(
+                model=self.model,
+                messages=self.get_messages_as_dicts(),
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": self.max_tokens
+                },
                 stream=True
-            ) as response:
-                response.raise_for_status()
-                
-                for line in response.iter_lines():
-                    if line:
-                        # Parse the JSON response
-                        try:
-                            chunk = json.loads(line)
-                            if "message" in chunk and "content" in chunk["message"]:
-                                content = chunk["message"]["content"]
-                                full_response += content
-                                yield content
-                        except json.JSONDecodeError:
-                            # Skip invalid JSON
-                            continue
+            )
+            
+            for chunk in stream:
+                content = chunk['message']['content']
+                full_response += content
+                yield content
             
             # Add the complete response to the conversation history
             self.add_assistant_message(full_response)
             
-        except requests.exceptions.RequestException as e:
+        except ollama.ResponseError as e:
             error_message = f"Error communicating with Ollama API: {str(e)}"
             raise Exception(error_message)
     
@@ -168,17 +135,12 @@ class OllamaChainlet(Chainlet):
             Exception: If there is an error communicating with the Ollama API.
         """
         try:
-            response = requests.get(
-                f"{base_url.rstrip('/')}/api/tags",
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            models = [model.get("name") for model in result.get("models", [])]
+            client = ollama.Client(host=base_url)
+            result = client.list()
+            models = [model.model for model in result.models]
             
             return models
-        
-        except requests.exceptions.RequestException as e:
+            
+        except ollama.ResponseError as e:
             error_message = f"Error listing models from Ollama API: {str(e)}"
             raise Exception(error_message)
