@@ -84,35 +84,77 @@ class MCPChainlet(OllamaChainlet):
         if not tools:
             return ""
         
-        context = "\n\nAvailable Tools:\n"
-        context += "You have access to the following tools via MCP. When you want to use a tool, respond with a JSON object containing 'tool_call' with 'name' and 'arguments' keys.\n\n"
+        # Simplified, concise tools context
+        context = "\n\nAvailable Browser Tools:\n"
+        context += "You can use browser automation tools. To use a tool, respond with JSON: {'tool_call': {'name': 'tool_name', 'arguments': {...}}}\n\n"
+        
+        # Only include essential browser tools to reduce context size
+        essential_tools = [
+            'browser_navigate', 'browser_click', 'browser_type', 
+            'browser_take_screenshot', 'browser_snapshot', 'browser_wait_for'
+        ]
         
         for tool in tools:
-            context += f"Tool: {tool.name}\n"
-            if tool.description:
-                context += f"Description: {tool.description}\n"
-            if tool.input_schema:
-                context += f"Input Schema: {json.dumps(tool.input_schema, indent=2)}\n"
-            context += "\n"
+            if tool.name in essential_tools:
+                context += f"- {tool.name}: {tool.description}\n"
+                # Only show required parameters for essential tools
+                if tool.input_schema and 'required' in tool.input_schema:
+                    required = tool.input_schema['required']
+                    if required:
+                        context += f"  Required: {', '.join(required)}\n"
         
-        context += "Example tool call format:\n"
-        context += '{"tool_call": {"name": "tool_name", "arguments": {"param": "value"}}}\n'
+        context += "\nExample: {'tool_call': {'name': 'browser_navigate', 'arguments': {'url': 'https://google.com'}}}\n"
         
         return context
     
     def _extract_tool_call(self, response: str) -> Optional[Dict[str, Any]]:
         """Extract tool call from LLM response."""
         try:
-            # Look for JSON objects in the response
+            # Look for JSON objects in the response - handle multi-line JSON and thinking tags
+            import re
+            import ast
+            
+            # First try to find a complete JSON object containing tool_call
+            json_pattern = r'\{[^{}]*?["\']tool_call["\'][^{}]*?\}'
+            match = re.search(json_pattern, response, re.DOTALL)
+            
+            if match:
+                json_str = match.group()
+                try:
+                    # Try standard JSON first
+                    tool_call_data = json.loads(json_str)
+                    if 'tool_call' in tool_call_data:
+                        return tool_call_data['tool_call']
+                except json.JSONDecodeError:
+                    try:
+                        # Try Python literal eval for single quotes
+                        tool_call_data = ast.literal_eval(json_str)
+                        if 'tool_call' in tool_call_data:
+                            return tool_call_data['tool_call']
+                    except:
+                        pass
+            
+            # Fallback: look line by line
             lines = response.strip().split('\n')
             for line in lines:
                 line = line.strip()
                 if line.startswith('{') and 'tool_call' in line:
-                    tool_call_data = json.loads(line)
-                    if 'tool_call' in tool_call_data:
-                        return tool_call_data['tool_call']
-        except json.JSONDecodeError:
-            pass
+                    try:
+                        # Try standard JSON first
+                        tool_call_data = json.loads(line)
+                        if 'tool_call' in tool_call_data:
+                            return tool_call_data['tool_call']
+                    except json.JSONDecodeError:
+                        try:
+                            # Try Python literal eval for single quotes
+                            tool_call_data = ast.literal_eval(line)
+                            if 'tool_call' in tool_call_data:
+                                return tool_call_data['tool_call']
+                        except:
+                            continue
+                        
+        except Exception as e:
+            logger.debug(f"Error extracting tool call: {e}")
         
         return None
     
@@ -158,38 +200,74 @@ class MCPChainlet(OllamaChainlet):
         Returns:
             str: The generated response, potentially including tool execution results.
         """
+        logger.debug(f"MCPChainlet.generate called with message: {user_message}")
+        
         # Initialize MCP if not already done
         if self._mcp_enabled and not self._tools_context:
+            logger.debug("Initializing MCP...")
             await self._initialize_mcp()
+            logger.debug(f"MCP initialized. Tools context length: {len(self._tools_context)}")
         
         # Temporarily update system prompt with tools context
         original_system_prompt = None
         if self._tools_context and self.messages and self.messages[0].role.value == "system":
             original_system_prompt = self.messages[0].content
             enhanced_prompt = self._get_enhanced_system_prompt()
+            logger.debug(f"Updating system prompt. Original length: {len(original_system_prompt)}, Enhanced length: {len(enhanced_prompt)}")
             self.messages[0].content = enhanced_prompt
         
         try:
-            # Generate initial response using parent class
-            response = await asyncio.to_thread(super().generate, user_message)
+            logger.debug("Calling parent generate method...")
+            logger.debug(f"Current message count: {len(self.messages)}")
+            
+            # Add user message if provided
+            if user_message:
+                self.add_user_message(user_message)
+                logger.debug(f"Added user message, new count: {len(self.messages)}")
+            
+            # Generate initial response using parent class (don't pass user_message to avoid duplication)
+            response = await asyncio.to_thread(super().generate)
+            logger.debug(f"Parent generate returned: {repr(response)} (length: {len(response)})")
             
             # Check if response contains a tool call
             tool_call = self._extract_tool_call(response)
+            logger.debug(f"Extracted tool call: {tool_call}")
+            
             if tool_call:
+                logger.debug(f"Executing tool call: {tool_call}")
                 # Execute the tool call
                 tool_result = await self._execute_tool_call(tool_call)
+                logger.debug(f"Tool result: {tool_result}")
                 
                 # Add tool result to conversation and generate follow-up
                 self.add_user_message(f"Tool result: {tool_result}")
                 follow_up = await asyncio.to_thread(super().generate)
+                logger.debug(f"Follow-up response: {repr(follow_up)}")
                 
                 return follow_up
             
+            logger.debug("No tool call found, returning original response")
             return response
+        
+        except Exception as e:
+            logger.error(f"Error in MCPChainlet.generate: {e}", exc_info=True)
+            # Fallback to basic generation without MCP
+            logger.debug("Falling back to basic generation")
+            if original_system_prompt and self.messages and self.messages[0].role.value == "system":
+                self.messages[0].content = original_system_prompt
+            
+            # Ensure user message is added for fallback
+            if user_message:
+                # Check if we already added it
+                if not self.messages or self.messages[-1].content != user_message:
+                    self.add_user_message(user_message)
+            
+            return await asyncio.to_thread(super().generate)
         
         finally:
             # Restore original system prompt
             if original_system_prompt and self.messages and self.messages[0].role.value == "system":
+                logger.debug("Restoring original system prompt")
                 self.messages[0].content = original_system_prompt
     
     async def generate_stream(self, user_message: Optional[str] = None) -> Iterator[str]:

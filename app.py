@@ -24,7 +24,7 @@ app = Flask(__name__)
 
 # Global variables
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:32b")
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "DEFAULT_SYSTEM_PROMPT",
     "You are a helpful AI assistant. Respond concisely and accurately to the user's questions."
