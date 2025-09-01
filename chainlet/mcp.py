@@ -7,6 +7,7 @@ integrating external tools and resources into chainlet conversations.
 
 import json
 import logging
+import asyncio
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
@@ -68,54 +69,93 @@ class MCPClient:
         self._session = None
         self._tools: List[MCPTool] = []
         self._connected = False
+        self._connection_lock = asyncio.Lock()
+        self._read = None
+        self._write = None
+        self._last_used = 0
+        import time
+        self._connection_timeout = 300  # 5 minutes
+    
+    async def _ensure_connection(self):
+        """Ensure we have an active connection, creating one if needed."""
+        async with self._connection_lock:
+            import time
+            current_time = time.time()
+            
+            # Check if connection exists and is not stale
+            if (self._session and self._connected and 
+                current_time - self._last_used < self._connection_timeout):
+                self._last_used = current_time
+                return self._session
+            
+            # Clean up old connection
+            if self._session:
+                try:
+                    # Don't await, just close
+                    self._session = None
+                    self._connected = False
+                except:
+                    pass
+            
+            # Create new connection
+            try:
+                if self.config.transport == "stdio":
+                    if StdioServerParameters is None:
+                        raise RuntimeError("MCP dependencies not available")
+                    server_params = StdioServerParameters(
+                        command=self.config.command,
+                        args=self.config.args or [],
+                        env=self.config.env or {}
+                    )
+                    if stdio_client is None or ClientSession is None:
+                        raise RuntimeError("MCP dependencies not available")
+                    
+                    # Store connection details for reuse
+                    if not self._read or not self._write:
+                        self._stdio_context = stdio_client(server_params)
+                        self._read, self._write = await self._stdio_context.__aenter__()
+                    
+                    session = ClientSession(self._read, self._write)
+                    await session.initialize()
+                    self._session = session
+                    self._connected = True
+                    self._last_used = current_time
+                
+                elif self.config.transport == "http":
+                    if streamablehttp_client is None or ClientSession is None:
+                        raise RuntimeError("MCP dependencies not available")
+                    
+                    if not self._read or not self._write:
+                        self._http_context = streamablehttp_client(self.config.url)
+                        self._read, self._write, _ = await self._http_context.__aenter__()
+                    
+                    session = ClientSession(self._read, self._write)
+                    await session.initialize()
+                    self._session = session
+                    self._connected = True
+                    self._last_used = current_time
+                else:
+                    raise ValueError(f"Unsupported transport: {self.config.transport}")
+                
+                return self._session
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to MCP server {self.config.name}: {e}")
+                self._session = None
+                self._connected = False
+                raise
     
     @asynccontextmanager
     async def connect(self):
-        """Connect to the MCP server and yield the session."""
-        try:
-            if self.config.transport == "stdio":
-                if StdioServerParameters is None:
-                    raise RuntimeError("MCP dependencies not available")
-                server_params = StdioServerParameters(
-                    command=self.config.command,
-                    args=self.config.args or [],
-                    env=self.config.env or {}
-                )
-                if stdio_client is None or ClientSession is None:
-                    raise RuntimeError("MCP dependencies not available")
-                async with stdio_client(server_params) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        self._session = session
-                        self._connected = True
-                        yield session
-            
-            elif self.config.transport == "http":
-                if streamablehttp_client is None or ClientSession is None:
-                    raise RuntimeError("MCP dependencies not available")
-                async with streamablehttp_client(self.config.url) as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        self._session = session
-                        self._connected = True
-                        yield session
-            else:
-                raise ValueError(f"Unsupported transport: {self.config.transport}")
-        
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server {self.config.name}: {e}")
-            raise
-        finally:
-            self._session = None
-            self._connected = False
+        """Connect to the MCP server and yield the session (legacy method)."""
+        session = await self._ensure_connection()
+        yield session
     
     async def discover_tools(self) -> List[MCPTool]:
         """Discover available tools from the server."""
-        if not self._session:
-            raise RuntimeError("Not connected to MCP server")
-        
         try:
-            tools_response = await self._session.list_tools()
+            session = await self._ensure_connection()
+            tools_response = await session.list_tools()
             self._tools = []
             
             for tool in tools_response.tools:
@@ -135,11 +175,14 @@ class MCPClient:
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a tool and return the result."""
-        if not self._session:
-            raise RuntimeError("Not connected to MCP server")
-        
         try:
-            result = await self._session.call_tool(tool_name, arguments)
+            session = await self._ensure_connection()
+            
+            # Add timeout for tool calls
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments),
+                timeout=60  # 1 minute timeout for tool calls
+            )
             
             # Handle different content types
             if result.content:
@@ -163,8 +206,17 @@ class MCPClient:
                 "structured": result.structuredContent
             }
         
+        except asyncio.TimeoutError:
+            logger.error(f"Tool call {tool_name} timed out")
+            return {
+                "success": False,
+                "error": f"Tool call timed out after 60 seconds"
+            }
         except Exception as e:
             logger.error(f"Failed to call tool {tool_name}: {e}")
+            # Reset connection on error
+            self._session = None
+            self._connected = False
             return {
                 "success": False,
                 "error": str(e)
@@ -211,25 +263,38 @@ class MCPManager:
         self._all_tools.clear()
         self._server_for_tool.clear()
         
-        for server_name, client in self._clients.items():
+        # Use asyncio.gather for parallel connections
+        async def connect_server(server_name, client):
             try:
-                async with client.connect() as session:
-                    tools = await client.discover_tools()
-                    for tool in tools:
-                        if tool.name in self._all_tools:
-                            logger.warning(f"Tool name conflict: {tool.name} exists in multiple servers")
-                            # Prefix with server name to avoid conflicts
-                            prefixed_name = f"{server_name}.{tool.name}"
-                            self._all_tools[prefixed_name] = tool
-                            self._server_for_tool[prefixed_name] = server_name
-                        else:
-                            self._all_tools[tool.name] = tool
-                            self._server_for_tool[tool.name] = server_name
-                    
-                    logger.info(f"Connected to {server_name}, discovered {len(tools)} tools")
+                tools = await client.discover_tools()
+                discovered_tools = []
+                for tool in tools:
+                    if tool.name in self._all_tools:
+                        logger.warning(f"Tool name conflict: {tool.name} exists in multiple servers")
+                        # Prefix with server name to avoid conflicts
+                        prefixed_name = f"{server_name}.{tool.name}"
+                        discovered_tools.append((prefixed_name, tool, server_name))
+                    else:
+                        discovered_tools.append((tool.name, tool, server_name))
+                
+                logger.info(f"Connected to {server_name}, discovered {len(tools)} tools")
+                return discovered_tools
             
             except Exception as e:
                 logger.error(f"Failed to connect to server {server_name}: {e}")
+                return []
+        
+        # Connect to all servers in parallel
+        tasks = [connect_server(name, client) for name, client in self._clients.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Aggregate results
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            for tool_name, tool, server_name in result:
+                self._all_tools[tool_name] = tool
+                self._server_for_tool[tool_name] = server_name
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a tool by name with arguments."""
@@ -243,8 +308,7 @@ class MCPManager:
         client = self._clients[server_name]
         
         try:
-            async with client.connect() as session:
-                return await client.call_tool(tool_name, arguments)
+            return await client.call_tool(tool_name, arguments)
         
         except Exception as e:
             logger.error(f"Failed to call tool {tool_name} on server {server_name}: {e}")
@@ -312,3 +376,12 @@ class MCPManager:
     def get_server_names(self) -> List[str]:
         """Get list of configured server names."""
         return list(self._clients.keys())
+    
+    async def cleanup(self) -> None:
+        """Clean up all client connections."""
+        for client in self._clients.values():
+            try:
+                client._session = None
+                client._connected = False
+            except Exception as e:
+                logger.error(f"Error cleaning up client: {e}")

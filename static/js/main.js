@@ -293,7 +293,7 @@ async function handleStreamingResponse(message, selectedModel) {
         throw new Error(errorData.error || 'Network response was not ok');
     }
     
-    // Read the stream
+    // Read the Server-Sent Events stream
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -309,38 +309,40 @@ async function handleStreamingResponse(message, selectedModel) {
         // Decode the chunk and add it to the buffer
         buffer += decoder.decode(value, { stream: true });
         
-        // Process complete JSON objects from the buffer
-        try {
-            // Try to parse the entire buffer as JSON
-            const result = JSON.parse(buffer);
-            
-            // If we got here, the buffer contains a complete JSON object
-            if (result.error) {
-                throw new Error(result.error);
-            }
-            
-            // Update the UI with all chunks
-            if (result.chunks && result.chunks.length > 0) {
-                for (const chunk of result.chunks) {
-                    updateStreamingMessage(chunk.content);
-                    fullResponse += chunk.content;
+        // Process complete SSE messages from the buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep the incomplete line in buffer
+        
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                try {
+                    const jsonData = line.substring(6); // Remove 'data: ' prefix
+                    if (jsonData.trim() === '') continue; // Skip empty data lines
+                    
+                    const result = JSON.parse(jsonData);
+                    
+                    if (result.error) {
+                        throw new Error(result.error);
+                    }
+                    
+                    if (result.content) {
+                        updateStreamingMessage(result.content);
+                        fullResponse += result.content;
+                    }
+                    
+                    if (result.done) {
+                        // Finalize the message with markdown rendering
+                        finalizeStreamingMessage(fullResponse);
+                        return;
+                    }
+                } catch (e) {
+                    console.error('Error parsing SSE data:', e, 'Data:', line);
                 }
             }
-            
-            // If done, break the loop
-            if (result.done) {
-                break;
-            }
-            
-            // Clear the buffer
-            buffer = '';
-        } catch (e) {
-            // If we get here, the buffer doesn't contain a complete JSON object yet
-            // Just continue reading more data
         }
     }
     
-    // Finalize the message with markdown rendering
+    // Finalize the message with markdown rendering (fallback)
     finalizeStreamingMessage(fullResponse);
 }
 

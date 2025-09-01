@@ -8,7 +8,7 @@ with Model Context Protocol capabilities for tool and resource access.
 import json
 import logging
 import asyncio
-from typing import Dict, Any, Optional, Iterator, List
+from typing import Dict, Any, Optional, Iterator, List, Callable
 
 from .ollama import OllamaChainlet
 from .mcp import MCPManager, MCPServerConfig
@@ -32,7 +32,8 @@ class MCPChainlet(OllamaChainlet):
         base_url: str = "http://localhost:11434",
         temperature: float = 0.7,
         max_tokens: int = 2048,
-        mcp_config: Optional[Dict[str, Any]] = None
+        mcp_config: Optional[Dict[str, Any]] = None,
+        timeout: int = None
     ):
         """
         Initialize an MCP-enabled chainlet.
@@ -45,17 +46,18 @@ class MCPChainlet(OllamaChainlet):
             max_tokens (int, optional): The maximum number of tokens to generate.
             mcp_config (Dict[str, Any], optional): MCP server configuration.
         """
-        # Initialize the base chainlet
-        super().__init__(model, system_prompt, base_url, temperature, max_tokens)
-        
-        # Initialize MCP manager
+        # Initialize MCP manager first
         self.mcp_manager = MCPManager()
         self._mcp_enabled = False
         self._tools_context = ""
+        self._mcp_tool_functions = []
         
         # Load MCP configuration if provided
         if mcp_config:
             self._load_mcp_config(mcp_config)
+        
+        # Initialize the base chainlet with MCP tool functions
+        super().__init__(model, system_prompt, base_url, temperature, max_tokens, timeout, tools=self._mcp_tool_functions)
     
     def _load_mcp_config(self, config: Dict[str, Any]) -> None:
         """Load MCP server configurations."""
@@ -74,89 +76,233 @@ class MCPChainlet(OllamaChainlet):
         try:
             await self.mcp_manager.connect_all()
             tools = self.mcp_manager.get_all_tools()
+            
+            # Create Python function wrappers for gpt-oss compatibility
+            self._mcp_tool_functions = self._create_tool_functions(tools)
+            
+            # Update the tools in the parent class
+            self.tools = self._mcp_tool_functions
+            
             self._tools_context = self._generate_tools_context(tools)
             logger.info(f"Initialized MCP with {len(tools)} tools")
         except Exception as e:
             logger.error(f"Failed to initialize MCP: {e}")
+    
+    def _create_tool_functions(self, tools) -> List[Callable]:
+        """Create Python function wrappers for MCP tools."""
+        tool_functions = []
+        
+        for tool in tools:
+            def create_tool_wrapper(tool_ref):
+                def tool_function(**kwargs):
+                    """Generated wrapper function for MCP tool."""
+                    try:
+                        # Run the async tool call in sync context
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # If we're already in an async context, use run_coroutine_threadsafe
+                            import concurrent.futures
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(asyncio.run, self.mcp_manager.call_tool(tool_ref.name, kwargs))
+                                result = future.result()
+                        else:
+                            # Run directly
+                            result = asyncio.run(self.mcp_manager.call_tool(tool_ref.name, kwargs))
+                        
+                        if result['success']:
+                            return result['result']
+                        else:
+                            return f"Error: {result['error']}"
+                    except Exception as e:
+                        return f"Tool execution error: {str(e)}"
+                
+                # Set function name and docstring for ollama
+                tool_function.__name__ = tool_ref.name
+                tool_function.__doc__ = tool_ref.description or f"MCP tool: {tool_ref.name}"
+                
+                return tool_function
+            
+            tool_functions.append(create_tool_wrapper(tool))
+        
+        return tool_functions
     
     def _generate_tools_context(self, tools) -> str:
         """Generate tools context for the language model."""
         if not tools:
             return ""
         
-        # Simplified, concise tools context
-        context = "\n\nAvailable Browser Tools:\n"
-        context += "You can use browser automation tools. To use a tool, respond with JSON: {'tool_call': {'name': 'tool_name', 'arguments': {...}}}\n\n"
+        # Detect if we're using gpt-oss model for different formatting
+        is_gpt_oss = 'gpt-oss' in self.model.lower()
         
-        # Only include essential browser tools to reduce context size
-        essential_tools = [
-            'browser_navigate', 'browser_click', 'browser_type', 
-            'browser_take_screenshot', 'browser_snapshot', 'browser_wait_for'
-        ]
-        
-        for tool in tools:
-            if tool.name in essential_tools:
-                context += f"- {tool.name}: {tool.description}\n"
-                # Only show required parameters for essential tools
-                if tool.input_schema and 'required' in tool.input_schema:
-                    required = tool.input_schema['required']
-                    if required:
-                        context += f"  Required: {', '.join(required)}\n"
-        
-        context += "\nExample: {'tool_call': {'name': 'browser_navigate', 'arguments': {'url': 'https://google.com'}}}\n"
+        if is_gpt_oss:
+            # For gpt-oss models, use explicit tool definitions in system prompt
+            # Based on web search findings: gpt-oss requires tools to be explicitly listed
+            context = "\n\n# Available Tools\n"
+            context += "You have access to browser automation tools. When you need to use a tool:\n"
+            context += "1. State your intention clearly\n"
+            context += "2. Use the specific tool format: TOOL_USE: tool_name(arguments)\n\n"
+            
+            essential_tools = [
+                ('browser_navigate', 'Navigate to a URL', 'url'),
+                ('browser_take_screenshot', 'Take a screenshot of current page', None),
+                ('browser_snapshot', 'Get page structure for analysis', None),
+                ('browser_click', 'Click on an element', 'element, ref')
+            ]
+            
+            for tool_name, description, args in essential_tools:
+                context += f"- {tool_name}: {description}\n"
+                if args:
+                    context += f"  Usage: TOOL_USE: {tool_name}({args})\n"
+                else:
+                    context += f"  Usage: TOOL_USE: {tool_name}()\n"
+            
+            context += "\nExample: TOOL_USE: browser_navigate(url='https://google.com')\n"
+            context += "Note: Always explain what you're doing before using tools.\n"
+        else:
+            # Standard JSON format for other models
+            context = "\n\nAvailable Browser Tools:\n"
+            context += "You can use browser automation tools. To use a tool, respond with JSON: {'tool_call': {'name': 'tool_name', 'arguments': {...}}}\n\n"
+            
+            # Only include essential browser tools to reduce context size
+            essential_tools = [
+                'browser_navigate', 'browser_click', 'browser_type', 
+                'browser_take_screenshot', 'browser_snapshot', 'browser_wait_for'
+            ]
+            
+            for tool in tools:
+                if tool.name in essential_tools:
+                    context += f"- {tool.name}: {tool.description}\n"
+                    # Only show required parameters for essential tools
+                    if tool.input_schema and 'required' in tool.input_schema:
+                        required = tool.input_schema['required']
+                        if required:
+                            context += f"  Required: {', '.join(required)}\n"
+            
+            context += "\nExample: {'tool_call': {'name': 'browser_navigate', 'arguments': {'url': 'https://google.com'}}}\n"
         
         return context
     
     def _extract_tool_call(self, response: str) -> Optional[Dict[str, Any]]:
         """Extract tool call from LLM response."""
         try:
-            # Look for JSON objects in the response - handle multi-line JSON and thinking tags
-            import re
-            import ast
+            # Detect if we're using gpt-oss model for different parsing
+            is_gpt_oss = 'gpt-oss' in self.model.lower()
             
-            # First try to find a complete JSON object containing tool_call
-            json_pattern = r'\{[^{}]*?["\']tool_call["\'][^{}]*?\}'
-            match = re.search(json_pattern, response, re.DOTALL)
+            if is_gpt_oss:
+                # For gpt-oss models, look for TOOL_USE format and natural language
+                import re
+                
+                # First look for explicit TOOL_USE format
+                tool_use_pattern = r'TOOL_USE:\s*([a-zA-Z_]+)\(([^)]*)\)'
+                match = re.search(tool_use_pattern, response, re.IGNORECASE)
+                
+                if match:
+                    tool_name = match.group(1)
+                    args_str = match.group(2)
+                    
+                    # Parse arguments
+                    arguments = {}
+                    if args_str.strip():
+                        # Simple parsing for key=value pairs
+                        arg_pattern = r"([a-zA-Z_]+)\s*=\s*['\"]([^'\"]*)['\"]?"
+                        arg_matches = re.findall(arg_pattern, args_str)
+                        for key, value in arg_matches:
+                            arguments[key] = value
+                    
+                    return {
+                        'name': tool_name,
+                        'arguments': arguments
+                    }
+                
+                # Fallback: natural language detection based on research findings
+                response_lower = response.lower().strip()
+                
+                # Screenshot detection
+                if any(keyword in response_lower for keyword in ['screenshot', 'capture', 'image of', 'snap', 'picture']):
+                    return {
+                        'name': 'browser_take_screenshot',
+                        'arguments': {}
+                    }
+                
+                # Navigation detection  
+                if any(keyword in response_lower for keyword in ['navigate', 'go to', 'visit', 'open', 'load']):
+                    # Try to extract URL
+                    url_patterns = [
+                        r'https?://[^\s]+',
+                        r'www\.[^\s]+',
+                        r'[^\s]+\.[a-z]{2,}(?:/[^\s]*)?'
+                    ]
+                    
+                    for pattern in url_patterns:
+                        match = re.search(pattern, response, re.IGNORECASE)
+                        if match:
+                            url = match.group()
+                            if not url.startswith('http'):
+                                url = 'https://' + url
+                            return {
+                                'name': 'browser_navigate',
+                                'arguments': {'url': url}
+                            }
+                
+                # Click detection
+                if any(keyword in response_lower for keyword in ['click', 'press', 'select', 'tap']):
+                    return {
+                        'name': 'browser_snapshot',  # Take snapshot first to see what's available
+                        'arguments': {}
+                    }
+                
+                return None
             
-            if match:
-                json_str = match.group()
-                try:
-                    # Try standard JSON first
-                    tool_call_data = json.loads(json_str)
-                    if 'tool_call' in tool_call_data:
-                        return tool_call_data['tool_call']
-                except json.JSONDecodeError:
-                    try:
-                        # Try Python literal eval for single quotes
-                        tool_call_data = ast.literal_eval(json_str)
-                        if 'tool_call' in tool_call_data:
-                            return tool_call_data['tool_call']
-                    except:
-                        pass
-            
-            # Fallback: look line by line
-            lines = response.strip().split('\n')
-            for line in lines:
-                line = line.strip()
-                if line.startswith('{') and 'tool_call' in line:
+            else:
+                # Standard JSON parsing for other models
+                import re
+                import ast
+                
+                # First try to find a complete JSON object containing tool_call
+                json_pattern = r'\{[^{}]*?["\']tool_call["\'][^{}]*?\}'
+                match = re.search(json_pattern, response, re.DOTALL)
+                
+                if match:
+                    json_str = match.group()
                     try:
                         # Try standard JSON first
-                        tool_call_data = json.loads(line)
+                        tool_call_data = json.loads(json_str)
                         if 'tool_call' in tool_call_data:
                             return tool_call_data['tool_call']
                     except json.JSONDecodeError:
                         try:
                             # Try Python literal eval for single quotes
-                            tool_call_data = ast.literal_eval(line)
+                            tool_call_data = ast.literal_eval(json_str)
                             if 'tool_call' in tool_call_data:
                                 return tool_call_data['tool_call']
                         except:
-                            continue
+                            pass
+                
+                # Fallback: look line by line
+                lines = response.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('{') and 'tool_call' in line:
+                        try:
+                            # Try standard JSON first
+                            tool_call_data = json.loads(line)
+                            if 'tool_call' in tool_call_data:
+                                return tool_call_data['tool_call']
+                        except json.JSONDecodeError:
+                            try:
+                                # Try Python literal eval for single quotes
+                                tool_call_data = ast.literal_eval(line)
+                                if 'tool_call' in tool_call_data:
+                                    return tool_call_data['tool_call']
+                            except:
+                                continue
+                
+                return None
                         
         except Exception as e:
             logger.debug(f"Error extracting tool call: {e}")
-        
-        return None
+            return None
     
     async def _execute_tool_call(self, tool_call: Dict[str, Any]) -> str:
         """Execute a tool call and return the result."""
@@ -190,6 +336,22 @@ class MCPChainlet(OllamaChainlet):
         
         return base_prompt
     
+    def _create_enhanced_messages(self) -> list:
+        """Create a copy of messages with enhanced system prompt without modifying original."""
+        if not self._tools_context or not self.messages:
+            return self.messages
+        
+        # Create a copy of messages
+        enhanced_messages = self.messages.copy()
+        
+        # Enhance system prompt in the copy
+        if enhanced_messages and enhanced_messages[0].role.value == "system":
+            from .core import Message, Role
+            enhanced_system_content = enhanced_messages[0].content + self._tools_context
+            enhanced_messages[0] = Message(Role.SYSTEM, enhanced_system_content)
+        
+        return enhanced_messages
+    
     async def generate(self, user_message: Optional[str] = None) -> str:
         """
         Generate a response with MCP tool support.
@@ -208,67 +370,70 @@ class MCPChainlet(OllamaChainlet):
             await self._initialize_mcp()
             logger.debug(f"MCP initialized. Tools context length: {len(self._tools_context)}")
         
-        # Temporarily update system prompt with tools context
-        original_system_prompt = None
-        if self._tools_context and self.messages and self.messages[0].role.value == "system":
-            original_system_prompt = self.messages[0].content
-            enhanced_prompt = self._get_enhanced_system_prompt()
-            logger.debug(f"Updating system prompt. Original length: {len(original_system_prompt)}, Enhanced length: {len(enhanced_prompt)}")
-            self.messages[0].content = enhanced_prompt
-        
         try:
-            logger.debug("Calling parent generate method...")
-            logger.debug(f"Current message count: {len(self.messages)}")
+            # For gpt-oss models, just use the parent's generate method 
+            # since it now handles tool calls properly
+            is_gpt_oss = 'gpt-oss' in self.model.lower()
+            if is_gpt_oss:
+                logger.debug("Using parent generate for gpt-oss model")
+                return await asyncio.to_thread(super().generate, user_message)
+            
+            # For other models, keep the original MCP logic with text-based tool calling
+            logger.debug("Using legacy MCP tool calling logic")
             
             # Add user message if provided
             if user_message:
                 self.add_user_message(user_message)
-                logger.debug(f"Added user message, new count: {len(self.messages)}")
             
-            # Generate initial response using parent class (don't pass user_message to avoid duplication)
-            response = await asyncio.to_thread(super().generate)
-            logger.debug(f"Parent generate returned: {repr(response)} (length: {len(response)})")
+            # Create enhanced messages without modifying original
+            original_messages = self.messages
+            enhanced_messages = self._create_enhanced_messages()
             
-            # Check if response contains a tool call
-            tool_call = self._extract_tool_call(response)
-            logger.debug(f"Extracted tool call: {tool_call}")
+            # Temporarily replace messages for generation
+            self.messages = enhanced_messages
             
-            if tool_call:
-                logger.debug(f"Executing tool call: {tool_call}")
-                # Execute the tool call
-                tool_result = await self._execute_tool_call(tool_call)
-                logger.debug(f"Tool result: {tool_result}")
+            try:
+                # Generate response using parent class
+                response = await asyncio.to_thread(super().generate)
                 
-                # Add tool result to conversation and generate follow-up
-                self.add_user_message(f"Tool result: {tool_result}")
-                follow_up = await asyncio.to_thread(super().generate)
-                logger.debug(f"Follow-up response: {repr(follow_up)}")
+                # Restore original messages
+                self.messages = original_messages
                 
-                return follow_up
-            
-            logger.debug("No tool call found, returning original response")
-            return response
+                # Check if response contains a tool call (legacy text-based approach)
+                tool_call = self._extract_tool_call(response)
+                
+                if tool_call:
+                    # Execute the tool call with timeout
+                    try:
+                        tool_result = await asyncio.wait_for(
+                            self._execute_tool_call(tool_call), 
+                            timeout=120
+                        )
+                    except asyncio.TimeoutError:
+                        tool_result = "Tool execution timed out"
+                    
+                    # Add tool result and generate follow-up
+                    self.add_user_message(f"Tool result: {tool_result}")
+                    enhanced_messages = self._create_enhanced_messages()
+                    self.messages = enhanced_messages
+                    
+                    try:
+                        follow_up = await asyncio.to_thread(super().generate)
+                        return follow_up
+                    finally:
+                        self.messages = original_messages
+                
+                return response
+                
+            except Exception as e:
+                # Restore messages on error
+                self.messages = original_messages
+                raise e
         
         except Exception as e:
             logger.error(f"Error in MCPChainlet.generate: {e}", exc_info=True)
-            # Fallback to basic generation without MCP
-            logger.debug("Falling back to basic generation")
-            if original_system_prompt and self.messages and self.messages[0].role.value == "system":
-                self.messages[0].content = original_system_prompt
-            
-            # Ensure user message is added for fallback
-            if user_message:
-                # Check if we already added it
-                if not self.messages or self.messages[-1].content != user_message:
-                    self.add_user_message(user_message)
-            
-            return await asyncio.to_thread(super().generate)
-        
-        finally:
-            # Restore original system prompt
-            if original_system_prompt and self.messages and self.messages[0].role.value == "system":
-                logger.debug("Restoring original system prompt")
-                self.messages[0].content = original_system_prompt
+            # Fallback to basic generation
+            return await asyncio.to_thread(super().generate, user_message)
     
     async def generate_stream(self, user_message: Optional[str] = None) -> Iterator[str]:
         """
@@ -284,40 +449,68 @@ class MCPChainlet(OllamaChainlet):
         if self._mcp_enabled and not self._tools_context:
             await self._initialize_mcp()
         
-        # Temporarily update system prompt with tools context
-        original_system_prompt = None
-        if self._tools_context and self.messages and self.messages[0].role.value == "system":
-            original_system_prompt = self.messages[0].content
-            enhanced_prompt = self._get_enhanced_system_prompt()
-            self.messages[0].content = enhanced_prompt
-        
         try:
+            # For gpt-oss models, just use the parent's generate_stream method 
+            # since it now handles tool calls properly
+            is_gpt_oss = 'gpt-oss' in self.model.lower()
+            if is_gpt_oss:
+                logger.debug("Using parent generate_stream for gpt-oss model")
+                for chunk in super().generate_stream(user_message):
+                    yield chunk
+                return
+            
+            # For other models, keep the original MCP logic
+            original_messages = self.messages
+            enhanced_messages = self._create_enhanced_messages()
+            
+            # Temporarily replace messages for generation
+            self.messages = enhanced_messages
+            
             # Collect the full response to check for tool calls
             full_response = ""
             
-            # Generate streaming response using parent class
-            for chunk in super().generate_stream(user_message):
-                full_response += chunk
-                yield chunk
+            try:
+                # Generate streaming response using parent class
+                for chunk in super().generate_stream(user_message):
+                    full_response += chunk
+                    yield chunk
+            finally:
+                # Always restore original messages
+                self.messages = original_messages
             
-            # Check if the complete response contains a tool call
+            # Check if the complete response contains a tool call (legacy approach)
             tool_call = self._extract_tool_call(full_response)
             if tool_call:
-                # Execute the tool call
-                tool_result = await self._execute_tool_call(tool_call)
+                # Execute the tool call with timeout
+                try:
+                    tool_result = await asyncio.wait_for(
+                        self._execute_tool_call(tool_call), 
+                        timeout=120
+                    )
+                except asyncio.TimeoutError:
+                    tool_result = "Tool execution timed out"
                 
                 # Add tool result and generate follow-up
                 self.add_user_message(f"Tool result: {tool_result}")
                 
-                # Stream the follow-up response
-                yield "\n\n"  # Separator
-                for chunk in super().generate_stream():
-                    yield chunk
+                # Stream the follow-up response with enhanced messages
+                enhanced_messages = self._create_enhanced_messages()
+                self.messages = enhanced_messages
+                
+                try:
+                    yield "\n\n"  # Separator
+                    for chunk in super().generate_stream():
+                        yield chunk
+                finally:
+                    # Restore original messages
+                    self.messages = original_messages
         
-        finally:
-            # Restore original system prompt
-            if original_system_prompt and self.messages and self.messages[0].role.value == "system":
-                self.messages[0].content = original_system_prompt
+        except Exception as e:
+            logger.error(f"Error in streaming generate: {e}")
+            # Ensure original messages are restored on error
+            if 'original_messages' in locals():
+                self.messages = original_messages
+            raise
     
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Get list of available MCP tools."""
@@ -326,6 +519,17 @@ class MCPChainlet(OllamaChainlet):
     def is_mcp_enabled(self) -> bool:
         """Check if MCP is enabled for this chainlet."""
         return self._mcp_enabled
+    
+    def _safely_modify_messages(self, modification_func):
+        """Safely modify messages with automatic restoration."""
+        original_messages = self.messages.copy() if self.messages else []
+        try:
+            modification_func()
+            return True
+        except Exception as e:
+            logger.error(f"Error modifying messages: {e}")
+            self.messages = original_messages
+            return False
     
     async def refresh_tools(self) -> None:
         """Refresh tool discovery from all servers."""
