@@ -53,6 +53,15 @@
                         <span class="toggle-label">Enable streaming</span>
                     </label>
                 </div>
+                
+                <!-- Browser Toggle -->
+                <div class="setting-group">
+                    <label class="setting-toggle">
+                        <input type="checkbox" id="browser-toggle">
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-label">Show browser</span>
+                    </label>
+                </div>
             </div>
             
             <!-- Status -->
@@ -63,26 +72,81 @@
         
         <!-- Main Chat Area -->
         <div class="main-area">
-            <div class="chat-container">
-                <div id="messages" class="messages-container">
-                    <div class="welcome-message">
-                        <div class="welcome-content">
-                            <h1>How can I help you today?</h1>
-                            <p>Choose a model from the sidebar and start chatting.</p>
+            <div class="content-container">
+                <!-- Chat Section -->
+                <div class="chat-container" id="chat-container">
+                    <div id="messages" class="messages-container">
+                        <div class="welcome-message">
+                            <div class="welcome-content">
+                                <h1>How can I help you today?</h1>
+                                <p>Choose a model from the sidebar and start chatting.</p>
+                            </div>
                         </div>
+                    </div>
+                    
+                    <!-- Input Area -->
+                    <div class="input-container">
+                        <form id="chat-form" class="input-form">
+                            <div class="input-wrapper">
+                                <textarea id="user-input" class="chat-input" placeholder="Message Ollama Chainlet..." rows="1"></textarea>
+                                <button type="submit" class="send-button" id="send-button">
+                                    <i class="bi bi-arrow-up"></i>
+                                </button>
+                            </div>
+                        </form>
                     </div>
                 </div>
                 
-                <!-- Input Area -->
-                <div class="input-container">
-                    <form id="chat-form" class="input-form">
-                        <div class="input-wrapper">
-                            <textarea id="user-input" class="chat-input" placeholder="Message Ollama Chainlet..." rows="1"></textarea>
-                            <button type="submit" class="send-button" id="send-button">
-                                <i class="bi bi-arrow-up"></i>
+                <!-- Browser Section -->
+                <div class="browser-container" id="browser-container" style="display: none;">
+                    <!-- Browser Toolbar -->
+                    <div class="browser-toolbar">
+                        <div class="browser-controls">
+                            <button class="browser-btn" id="browser-back" title="Go back">
+                                <i class="bi bi-arrow-left"></i>
+                            </button>
+                            <button class="browser-btn" id="browser-forward" title="Go forward">
+                                <i class="bi bi-arrow-right"></i>
+                            </button>
+                            <button class="browser-btn" id="browser-refresh" title="Refresh page">
+                                <i class="bi bi-arrow-clockwise"></i>
                             </button>
                         </div>
-                    </form>
+                        
+                        <div class="browser-address-bar">
+                            <input type="text" id="browser-url" class="browser-url-input" placeholder="Enter URL..." value="">
+                            <button class="browser-btn browser-go" id="browser-go" title="Navigate">
+                                <i class="bi bi-arrow-right"></i>
+                            </button>
+                        </div>
+                        
+                        <div class="browser-actions">
+                            <button class="browser-btn" id="browser-screenshot" title="Take screenshot">
+                                <i class="bi bi-camera"></i>
+                            </button>
+                            <button class="browser-btn" id="browser-inspect" title="Inspect page">
+                                <i class="bi bi-search"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Browser Content -->
+                    <div class="browser-content" id="browser-content">
+                        <div class="browser-placeholder">
+                            <div class="browser-placeholder-content">
+                                <i class="bi bi-globe"></i>
+                                <h3>Browser</h3>
+                                <p>Enter a URL above to start browsing</p>
+                            </div>
+                        </div>
+                        <div class="browser-loading" id="browser-loading" style="display: none;">
+                            <div class="loading-spinner"></div>
+                            <p>Loading page...</p>
+                        </div>
+                        <div class="browser-screenshot-view" id="browser-screenshot-view" style="display: none;">
+                            <img id="browser-screenshot-img" src="" alt="Browser screenshot">
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

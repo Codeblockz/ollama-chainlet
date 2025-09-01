@@ -656,3 +656,296 @@ body {
     font-style: italic;
     color: var(--text-secondary);
 }
+
+/* Browser Integration Styles */
+.content-container {
+    display: flex;
+    height: 100%;
+    width: 100%;
+}
+
+.chat-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    transition: flex 0.3s ease;
+}
+
+.chat-container.split-view {
+    flex: 0.6;
+}
+
+.browser-container {
+    flex: 0.4;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border-light);
+    background-color: var(--bg-secondary);
+    min-width: 400px;
+}
+
+/* Browser Toolbar */
+.browser-toolbar {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    background-color: var(--bg-sidebar);
+    border-bottom: 1px solid var(--border-light);
+    gap: 8px;
+    min-height: 48px;
+}
+
+.browser-controls {
+    display: flex;
+    gap: 4px;
+}
+
+.browser-btn {
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background-color: transparent;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-size: 14px;
+}
+
+.browser-btn:hover {
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.browser-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.browser-address-bar {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+    margin: 0 8px;
+}
+
+.browser-url-input {
+    flex: 1;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 13px;
+    padding: 4px 0;
+}
+
+.browser-url-input::placeholder {
+    color: var(--text-muted);
+}
+
+.browser-go {
+    background-color: var(--accent-primary);
+    color: white;
+}
+
+.browser-go:hover {
+    background-color: var(--accent-hover);
+}
+
+.browser-actions {
+    display: flex;
+    gap: 4px;
+}
+
+/* Browser Content */
+.browser-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    background-color: var(--bg-primary);
+}
+
+.browser-placeholder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+.browser-placeholder-content {
+    max-width: 200px;
+}
+
+.browser-placeholder-content i {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.5;
+}
+
+.browser-placeholder-content h3 {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: var(--text-secondary);
+}
+
+.browser-placeholder-content p {
+    font-size: 14px;
+    margin: 0;
+    opacity: 0.8;
+}
+
+/* Browser Loading */
+.browser-loading {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(255, 255, 255, 0.9);
+    z-index: 10;
+}
+
+.loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--border-light);
+    border-top: 3px solid var(--accent-primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 16px;
+}
+
+.browser-loading p {
+    margin: 0;
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+/* Browser Screenshot View */
+.browser-screenshot-view {
+    flex: 1;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    overflow: auto;
+}
+
+.browser-screenshot-view img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: var(--radius-sm);
+    box-shadow: 0 2px 8px var(--shadow-medium);
+}
+
+/* URL Suggestion */
+.url-suggestion {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    margin: 16px 0;
+    text-align: center;
+}
+
+.url-suggestion p {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.url-suggestion button {
+    background-color: var(--accent-primary);
+    color: white;
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+.url-suggestion button:hover {
+    background-color: var(--accent-hover);
+}
+
+/* Responsive Browser Layout */
+@media (max-width: 1200px) {
+    .browser-container {
+        min-width: 300px;
+    }
+    
+    .chat-container.split-view {
+        flex: 0.5;
+    }
+}
+
+@media (max-width: 768px) {
+    .content-container {
+        flex-direction: column;
+    }
+    
+    .chat-container.split-view {
+        flex: 0.4;
+        min-height: 40vh;
+    }
+    
+    .browser-container {
+        flex: 0.6;
+        min-width: unset;
+        min-height: 60vh;
+        border-left: none;
+        border-top: 1px solid var(--border-light);
+    }
+    
+    .browser-toolbar {
+        flex-wrap: wrap;
+        min-height: auto;
+        padding: 8px;
+    }
+    
+    .browser-address-bar {
+        order: 2;
+        width: 100%;
+        margin: 4px 0 0 0;
+    }
+    
+    .browser-controls {
+        order: 1;
+    }
+    
+    .browser-actions {
+        order: 3;
+        margin-left: auto;
+    }
+}
+
+/* Dark mode adjustments for browser */
+@media (prefers-color-scheme: dark) {
+    .browser-loading {
+        background-color: rgba(23, 23, 23, 0.9);
+    }
+    
+    .url-suggestion {
+        background-color: var(--bg-sidebar);
+        border-color: var(--border-light);
+    }
+}

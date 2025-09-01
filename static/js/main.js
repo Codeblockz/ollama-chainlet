@@ -18,10 +18,26 @@ const sidebarToggle = document.getElementById('sidebar-toggle');
 const sidebar = document.getElementById('sidebar');
 const sendButton = document.getElementById('send-button');
 
+// Browser elements
+const browserToggle = document.getElementById('browser-toggle');
+const browserContainer = document.getElementById('browser-container');
+const chatContainer = document.getElementById('chat-container');
+const browserUrl = document.getElementById('browser-url');
+const browserGoBtn = document.getElementById('browser-go');
+const browserBackBtn = document.getElementById('browser-back');
+const browserForwardBtn = document.getElementById('browser-forward');
+const browserRefreshBtn = document.getElementById('browser-refresh');
+const browserScreenshotBtn = document.getElementById('browser-screenshot');
+const browserInspectBtn = document.getElementById('browser-inspect');
+const browserLoading = document.getElementById('browser-loading');
+const browserScreenshotView = document.getElementById('browser-screenshot-view');
+const browserScreenshotImg = document.getElementById('browser-screenshot-img');
+
 // State
 let conversationId = generateId();
 let isProcessing = false;
 let currentMessageDiv = null;
+let browserActive = false;
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -29,6 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     adjustTextareaHeight();
     setupMobileMenu();
+    setupBrowser();
 });
 
 /**
@@ -177,6 +194,9 @@ async function handleSubmit(event) {
     // Hide welcome message and add user message to the UI
     messagesContainer.classList.add('has-messages');
     addMessage(message, 'user');
+    
+    // Check for URLs and offer browser navigation
+    detectAndOfferBrowsing(message);
     
     // Clear the input
     userInput.value = '';
@@ -524,3 +544,339 @@ function setupMobileMenu() {
         });
     }
 }
+
+/**
+ * Setup browser functionality
+ */
+function setupBrowser() {
+    // Browser toggle event listener
+    if (browserToggle) {
+        browserToggle.addEventListener('change', toggleBrowser);
+        
+        // Load saved preference
+        const savedBrowserState = localStorage.getItem('browser-enabled');
+        if (savedBrowserState === 'true') {
+            browserToggle.checked = true;
+            toggleBrowser();
+        }
+    }
+    
+    // Browser navigation event listeners
+    if (browserGoBtn) {
+        browserGoBtn.addEventListener('click', navigateBrowser);
+    }
+    
+    if (browserUrl) {
+        browserUrl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                navigateBrowser();
+            }
+        });
+    }
+    
+    // Browser control event listeners
+    if (browserBackBtn) {
+        browserBackBtn.addEventListener('click', () => browserAction('back'));
+    }
+    
+    if (browserForwardBtn) {
+        browserForwardBtn.addEventListener('click', () => browserAction('forward'));
+    }
+    
+    if (browserRefreshBtn) {
+        browserRefreshBtn.addEventListener('click', () => {
+            if (browserUrl.value) {
+                navigateBrowser();
+            }
+        });
+    }
+    
+    if (browserScreenshotBtn) {
+        browserScreenshotBtn.addEventListener('click', takeBrowserScreenshot);
+    }
+    
+    if (browserInspectBtn) {
+        browserInspectBtn.addEventListener('click', inspectBrowserPage);
+    }
+}
+
+/**
+ * Toggle browser visibility
+ */
+function toggleBrowser() {
+    const isEnabled = browserToggle && browserToggle.checked;
+    browserActive = isEnabled;
+    
+    if (browserContainer && chatContainer) {
+        if (isEnabled) {
+            browserContainer.style.display = 'flex';
+            chatContainer.classList.add('split-view');
+        } else {
+            browserContainer.style.display = 'none';
+            chatContainer.classList.remove('split-view');
+        }
+    }
+    
+    // Save preference
+    localStorage.setItem('browser-enabled', isEnabled.toString());
+    
+    // Adjust layout
+    adjustLayout();
+}
+
+/**
+ * Navigate browser to URL
+ */
+async function navigateBrowser() {
+    const url = browserUrl.value.trim();
+    if (!url) return;
+    
+    // Add protocol if missing
+    const finalUrl = url.match(/^https?:\/\//) ? url : `https://${url}`;
+    browserUrl.value = finalUrl;
+    
+    try {
+        showBrowserLoading(true);
+        hideBrowserScreenshot();
+        
+        const response = await fetch('/api/browser/navigate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                conversation_id: conversationId,
+                url: finalUrl
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
+        }
+        
+        // Automatically take screenshot after navigation
+        setTimeout(() => {
+            takeBrowserScreenshot();
+        }, 2000);
+        
+        showStatus(`Navigated to ${finalUrl}`, 'success', 3000);
+        
+    } catch (error) {
+        showBrowserLoading(false);
+        showStatus(`Navigation error: ${error.message}`, 'danger', 5000);
+        console.error('Navigation error:', error);
+    }
+}
+
+/**
+ * Execute browser action
+ */
+async function browserAction(action, params = {}) {
+    try {
+        showBrowserLoading(true);
+        
+        const response = await fetch('/api/browser/action', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                conversation_id: conversationId,
+                action: action,
+                params: params
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
+        }
+        
+        // Take screenshot after action
+        setTimeout(() => {
+            takeBrowserScreenshot();
+        }, 1000);
+        
+        showStatus(`Browser action completed: ${action}`, 'success', 2000);
+        
+    } catch (error) {
+        showBrowserLoading(false);
+        showStatus(`Browser action error: ${error.message}`, 'danger', 5000);
+        console.error('Browser action error:', error);
+    }
+}
+
+/**
+ * Take browser screenshot
+ */
+async function takeBrowserScreenshot() {
+    try {
+        showBrowserLoading(true);
+        
+        const response = await fetch('/api/browser/screenshot', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                conversation_id: conversationId
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
+        }
+        
+        if (data.screenshot_data) {
+            // Display screenshot in browser view
+            showBrowserScreenshot(data.screenshot_data);
+            
+            // Also add to chat
+            addMessage(`📸 Browser Screenshot taken`, 'system');
+        }
+        
+        showBrowserLoading(false);
+        
+    } catch (error) {
+        showBrowserLoading(false);
+        showStatus(`Screenshot error: ${error.message}`, 'danger', 5000);
+        console.error('Screenshot error:', error);
+    }
+}
+
+/**
+ * Inspect browser page
+ */
+async function inspectBrowserPage() {
+    try {
+        showBrowserLoading(true);
+        
+        const response = await fetch('/api/browser/snapshot', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                conversation_id: conversationId
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
+        }
+        
+        if (data.snapshot_data) {
+            // Add page structure to chat
+            addMessage(`🔍 Page Structure:\n\`\`\`\n${data.snapshot_data}\n\`\`\``, 'system');
+        }
+        
+        showBrowserLoading(false);
+        
+    } catch (error) {
+        showBrowserLoading(false);
+        showStatus(`Inspection error: ${error.message}`, 'danger', 5000);
+        console.error('Inspection error:', error);
+    }
+}
+
+/**
+ * Show browser loading state
+ */
+function showBrowserLoading(show) {
+    if (browserLoading) {
+        browserLoading.style.display = show ? 'flex' : 'none';
+    }
+}
+
+/**
+ * Show browser screenshot
+ */
+function showBrowserScreenshot(screenshotData) {
+    if (browserScreenshotView && browserScreenshotImg) {
+        browserScreenshotImg.src = `data:image/png;base64,${screenshotData}`;
+        browserScreenshotView.style.display = 'block';
+        
+        // Hide placeholder
+        const placeholder = document.querySelector('.browser-placeholder');
+        if (placeholder) {
+            placeholder.style.display = 'none';
+        }
+    }
+}
+
+/**
+ * Hide browser screenshot
+ */
+function hideBrowserScreenshot() {
+    if (browserScreenshotView) {
+        browserScreenshotView.style.display = 'none';
+        
+        // Show placeholder
+        const placeholder = document.querySelector('.browser-placeholder');
+        if (placeholder) {
+            placeholder.style.display = 'flex';
+        }
+    }
+}
+
+/**
+ * Adjust layout for browser/chat split
+ */
+function adjustLayout() {
+    // This will be handled by CSS classes
+    // The split-view class is added/removed in toggleBrowser()
+}
+
+/**
+ * Detect URLs in chat messages and offer browser navigation
+ */
+function detectAndOfferBrowsing(message) {
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const urls = message.match(urlRegex);
+    
+    if (urls && urls.length > 0 && !browserActive) {
+        // Show suggestion to enable browser
+        const suggestion = document.createElement('div');
+        suggestion.className = 'url-suggestion';
+        suggestion.innerHTML = `
+            <p>🌐 URL detected: <strong>${urls[0]}</strong></p>
+            <button class="btn btn-sm btn-primary" onclick="enableBrowserAndNavigate('${urls[0]}')">
+                Open in Browser
+            </button>
+        `;
+        
+        messagesContainer.appendChild(suggestion);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    } else if (urls && urls.length > 0 && browserActive) {
+        // Auto-navigate if browser is already active
+        browserUrl.value = urls[0];
+        navigateBrowser();
+    }
+}
+
+/**
+ * Enable browser and navigate to URL
+ */
+function enableBrowserAndNavigate(url) {
+    if (browserToggle) {
+        browserToggle.checked = true;
+        toggleBrowser();
+    }
+    
+    setTimeout(() => {
+        if (browserUrl) {
+            browserUrl.value = url;
+            navigateBrowser();
+        }
+    }, 100);
+}
+
+// Make enableBrowserAndNavigate globally available
+window.enableBrowserAndNavigate = enableBrowserAndNavigate;
