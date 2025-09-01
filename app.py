@@ -8,6 +8,8 @@ through a chainlet interface.
 import os
 import json
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
@@ -34,6 +36,36 @@ MCP_CONFIG_PATH = os.getenv("MCP_CONFIG_PATH", "mcp_config/servers.json")
 # Store active chainlets
 chainlets: Dict[str, OllamaChainlet] = {}
 
+# Global thread pool for async operations
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Global event loop for MCP operations
+_mcp_loop = None
+_mcp_thread = None
+
+def get_mcp_loop():
+    """Get or create the MCP event loop."""
+    global _mcp_loop, _mcp_thread
+    if _mcp_loop is None or _mcp_loop.is_closed():
+        def run_loop():
+            global _mcp_loop
+            _mcp_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_mcp_loop)
+            _mcp_loop.run_forever()
+        
+        _mcp_thread = threading.Thread(target=run_loop, daemon=True)
+        _mcp_thread.start()
+        # Wait a moment for loop to be ready
+        import time
+        time.sleep(0.1)
+    return _mcp_loop
+
+def run_async_in_mcp_loop(coro):
+    """Run a coroutine in the MCP event loop."""
+    loop = get_mcp_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=60)  # 1 minute timeout - much more reasonable
+
 # Load MCP configuration
 def load_mcp_config() -> Optional[Dict[str, Any]]:
     """Load MCP configuration from file if it exists."""
@@ -48,8 +80,24 @@ def load_mcp_config() -> Optional[Dict[str, Any]]:
 MCP_CONFIG = load_mcp_config()
 
 
+def should_use_mcp(message: str) -> bool:
+    """Determine if MCP should be used based on message content."""
+    # Only use MCP if explicitly configured and message suggests tool usage
+    if not MCP_CONFIG:
+        return False
+    
+    # Simple heuristics for tool usage (can be enhanced later)
+    tool_keywords = [
+        'search', 'find', 'lookup', 'browse', 'web', 'url',
+        'file', 'read', 'write', 'execute', 'run', 'code',
+        'api', 'request', 'call', 'fetch', 'get', 'post'
+    ]
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in tool_keywords)
+
+
 async def async_stream_to_sync(async_gen):
-    """Convert async generator to sync generator for Flask compatibility."""
+    """Convert async generator to sync list for Flask compatibility."""
     chunks = []
     async for chunk in async_gen:
         chunks.append(chunk)
@@ -85,9 +133,11 @@ def chat():
         system_prompt = data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
         temperature = float(data.get("temperature", 0.7))
         
-        # Get or create chainlet (MCP-enabled if config available)
+        # Get or create chainlet (use MCP only if message suggests tool usage)
+        use_mcp = should_use_mcp(message)
+        
         if conversation_id not in chainlets:
-            if MCP_CONFIG:
+            if use_mcp:
                 chainlets[conversation_id] = MCPChainlet(
                     model=model_name,
                     system_prompt=system_prompt,
@@ -103,16 +153,42 @@ def chat():
                     temperature=temperature
                 )
         
-        # Generate response (handle async MCP calls in sync context)
-        if isinstance(chainlets[conversation_id], MCPChainlet):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Generate response - upgrade to MCP if needed, or use existing chainlet
+        current_chainlet = chainlets[conversation_id]
+        
+        if use_mcp and not isinstance(current_chainlet, MCPChainlet):
+            # Upgrade to MCP chainlet for this request
+            mcp_chainlet = MCPChainlet(
+                model=model_name,
+                system_prompt=system_prompt,
+                base_url=OLLAMA_BASE_URL,
+                temperature=temperature,
+                mcp_config=MCP_CONFIG
+            )
+            # Copy message history
+            mcp_chainlet.messages = current_chainlet.messages.copy()
+            current_chainlet = mcp_chainlet
+            chainlets[conversation_id] = mcp_chainlet
+        
+        # Generate response
+        if isinstance(current_chainlet, MCPChainlet):
             try:
-                response = loop.run_until_complete(chainlets[conversation_id].generate(message))
-            finally:
-                loop.close()
+                response = run_async_in_mcp_loop(current_chainlet.generate(message))
+            except Exception as e:
+                # Fallback to regular chainlet on MCP failure
+                print(f"MCP generation failed, falling back to regular chainlet: {e}")
+                fallback_chainlet = OllamaChainlet(
+                    model=model_name,
+                    system_prompt=system_prompt,
+                    base_url=OLLAMA_BASE_URL,
+                    temperature=temperature
+                )
+                # Copy message history
+                fallback_chainlet.messages = current_chainlet.messages.copy()
+                response = fallback_chainlet.generate(message)
+                chainlets[conversation_id] = fallback_chainlet  # Replace with fallback
         else:
-            response = chainlets[conversation_id].generate(message)
+            response = current_chainlet.generate(message)
         
         # Get conversation history
         history = chainlets[conversation_id].get_messages_as_dicts()
@@ -140,9 +216,11 @@ def chat_stream():
         system_prompt = data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
         temperature = float(data.get("temperature", 0.7))
         
-        # Get or create chainlet (MCP-enabled if config available)
+        # Get or create chainlet (use MCP only if message suggests tool usage)
+        use_mcp = should_use_mcp(message)
+        
         if conversation_id not in chainlets:
-            if MCP_CONFIG:
+            if use_mcp:
                 chainlets[conversation_id] = MCPChainlet(
                     model=model_name,
                     system_prompt=system_prompt,
@@ -158,55 +236,109 @@ def chat_stream():
                     temperature=temperature
                 )
         
+        # Upgrade to MCP if needed
+        current_chainlet = chainlets[conversation_id]
+        if use_mcp and not isinstance(current_chainlet, MCPChainlet):
+            # Upgrade to MCP chainlet for this request
+            mcp_chainlet = MCPChainlet(
+                model=model_name,
+                system_prompt=system_prompt,
+                base_url=OLLAMA_BASE_URL,
+                temperature=temperature,
+                mcp_config=MCP_CONFIG
+            )
+            # Copy message history
+            mcp_chainlet.messages = current_chainlet.messages.copy()
+            current_chainlet = mcp_chainlet
+            chainlets[conversation_id] = mcp_chainlet
+        
         def generate():
             """Generate streaming response."""
             try:
-                # Start with an empty JSON object
-                yield '{"conversation_id": "%s", "response": "", "chunks": [' % conversation_id
-                
                 # Stream the response chunks (async if MCP-enabled)
-                first_chunk = True
-                if isinstance(chainlets[conversation_id], MCPChainlet):
-                    # Handle async streaming for MCP chainlet
-                    async def async_stream():
-                        async for chunk in chainlets[conversation_id].generate_stream(message):
-                            yield chunk
-                    
-                    # Run async generator in sync context
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                if isinstance(current_chainlet, MCPChainlet):
                     try:
-                        for chunk in loop.run_until_complete(async_stream_to_sync(chainlets[conversation_id].generate_stream(message))):
-                            if not first_chunk:
-                                yield ','
-                            else:
-                                first_chunk = False
-                            
-                            chunk_json = json.dumps({"content": chunk})
-                            yield chunk_json
-                    finally:
-                        loop.close()
+                        # Handle async streaming for MCP chainlet using dedicated loop
+                        async def async_stream():
+                            async for chunk in chainlets[conversation_id].generate_stream(message):
+                                yield chunk
+                        
+                        # Run in dedicated MCP loop
+                        loop = get_mcp_loop()
+                        
+                        # Use a queue to bridge async and sync streaming
+                        import queue
+                        import threading
+                        
+                        chunk_queue = queue.Queue()
+                        exception_holder = [None]
+                        
+                        def stream_producer():
+                            try:
+                                async def producer():
+                                    try:
+                                        async for chunk in current_chainlet.generate_stream(message):
+                                            chunk_queue.put(("chunk", chunk))
+                                        chunk_queue.put(("done", None))
+                                    except Exception as e:
+                                        exception_holder[0] = e
+                                        chunk_queue.put(("error", str(e)))
+                                
+                                future = asyncio.run_coroutine_threadsafe(producer(), loop)
+                                future.result(timeout=60)  # 1 minute timeout
+                            except Exception as e:
+                                exception_holder[0] = e
+                                chunk_queue.put(("error", str(e)))
+                        
+                        producer_thread = threading.Thread(target=stream_producer)
+                        producer_thread.start()
+                        
+                        while True:
+                            try:
+                                msg_type, content = chunk_queue.get(timeout=30)
+                                if msg_type == "chunk":
+                                    chunk_data = json.dumps({"content": content})
+                                    yield f"data: {chunk_data}\n\n"
+                                elif msg_type == "done":
+                                    break
+                                elif msg_type == "error":
+                                    if exception_holder[0]:
+                                        raise exception_holder[0]
+                                    break
+                            except queue.Empty:
+                                # Timeout - break and let it fallback
+                                break
+                                
+                    except Exception as e:
+                        # Fallback to regular streaming on MCP failure
+                        print(f"MCP streaming failed, falling back: {e}")
+                        fallback_chainlet = OllamaChainlet(
+                            model=model_name,
+                            system_prompt=system_prompt,
+                            base_url=OLLAMA_BASE_URL,
+                            temperature=temperature
+                        )
+                        fallback_chainlet.messages = current_chainlet.messages.copy()
+                        for chunk in fallback_chainlet.generate_stream(message):
+                            chunk_data = json.dumps({"content": chunk})
+                            yield f"data: {chunk_data}\n\n"
+                        chainlets[conversation_id] = fallback_chainlet
                 else:
                     # Handle sync streaming for regular chainlet
-                    for chunk in chainlets[conversation_id].generate_stream(message):
-                        if not first_chunk:
-                            yield ','
-                        else:
-                            first_chunk = False
-                        
-                        chunk_json = json.dumps({"content": chunk})
-                        yield chunk_json
+                    for chunk in current_chainlet.generate_stream(message):
+                        chunk_data = json.dumps({"content": chunk})
+                        yield f"data: {chunk_data}\n\n"
                 
-                # End the JSON array and object
-                yield '], "done": true}'
+                # Send done signal
+                yield f"data: {json.dumps({'done': True})}\n\n"
                 
             except Exception as e:
                 # If an error occurs during streaming, send an error message
-                error_json = json.dumps({"error": str(e)})
-                yield '], "error": %s}' % error_json
+                error_data = json.dumps({"error": str(e)})
+                yield f"data: {error_data}\n\n"
         
-        # Return a streaming response
-        return Response(stream_with_context(generate()), content_type='application/json')
+        # Return a streaming response as Server-Sent Events
+        return Response(stream_with_context(generate()), content_type='text/event-stream')
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -240,13 +372,12 @@ def get_mcp_tools():
         )
         
         # Run async tool discovery in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(temp_chainlet.refresh_tools())
+            run_async_in_mcp_loop(temp_chainlet.refresh_tools())
             tools = temp_chainlet.get_available_tools()
-        finally:
-            loop.close()
+        except Exception as e:
+            print(f"Failed to refresh MCP tools: {e}")
+            tools = []
         
         return jsonify({"tools": tools, "mcp_enabled": True})
     
