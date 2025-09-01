@@ -10,10 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Running the Application
 - **Start Flask app**: `python app.py` (runs on http://localhost:5000)
-- **Test framework**: `python test_chainlet.py` - Tests core functionality with mock data
 
 ### Dependencies
-- Core dependencies in `requirements.txt`: Flask==2.3.3, requests==2.31.0, python-dotenv==1.0.0
+- Core dependencies in `requirements.txt`: Flask==2.3.3, requests==2.31.0, python-dotenv==1.0.0, mcp>=1.0.0, pydantic>=2.0.0, ollama
 
 ## Architecture Overview
 
@@ -21,12 +20,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Flask Web Application** (`app.py`): Main web server with REST API endpoints for chat interactions
 - **Chainlet Framework** (`chainlet/`): Modular conversation management system
   - `core.py`: Base classes for Message, Role enum, and abstract Chainlet
-  - `ollama.py`: OllamaChainlet implementation for Ollama API integration
+  - `ollama.py`: OllamaChainlet implementation for Ollama API integration using official ollama Python client
+  - `mcp.py`: MCP (Model Context Protocol) infrastructure for external tool integration
+  - `mcp_chainlet.py`: MCP-enhanced chainlet that extends OllamaChainlet with tool capabilities
 
 ### Key Design Patterns
 - **Conversation Management**: Each conversation has a unique ID and maintains message history
 - **Streaming Support**: Both regular and streaming chat responses via `/api/chat` and `/api/chat/stream`
 - **Model Abstraction**: Chainlet base class allows for different LLM integrations
+- **MCP Integration**: Model Context Protocol support for external tool access and enhanced capabilities
 
 ### API Endpoints
 - `GET /api/models` - List available Ollama models
