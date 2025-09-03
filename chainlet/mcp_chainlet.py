@@ -8,10 +8,11 @@ with Model Context Protocol capabilities for tool and resource access.
 import json
 import logging
 import asyncio
+import threading
 from typing import Dict, Any, Optional, Iterator, List, Callable
 
 from .ollama import OllamaChainlet
-from .mcp import MCPManager, MCPServerConfig
+from .mcp import MCPManager, MCPServerConfig, MCP_AVAILABLE, MCPNotAvailableError
 
 
 logger = logging.getLogger(__name__)
@@ -46,18 +47,49 @@ class MCPChainlet(OllamaChainlet):
             max_tokens (int, optional): The maximum number of tokens to generate.
             mcp_config (Dict[str, Any], optional): MCP server configuration.
         """
-        # Initialize MCP manager first
-        self.mcp_manager = MCPManager()
-        self._mcp_enabled = False
-        self._tools_context = ""
-        self._mcp_tool_functions = []
-        
-        # Load MCP configuration if provided
-        if mcp_config:
-            self._load_mcp_config(mcp_config)
+        # Initialize MCP manager first (only if MCP is available)
+        if MCP_AVAILABLE:
+            self.mcp_manager = MCPManager()
+            self._mcp_enabled = False
+            self._tools_context = ""
+            self._mcp_tool_functions = []
+            
+            # Load MCP configuration if provided
+            if mcp_config:
+                self._load_mcp_config(mcp_config)
+        else:
+            self.mcp_manager = None
+            self._mcp_enabled = False
+            self._tools_context = ""
+            self._mcp_tool_functions = []
+            if mcp_config:
+                logger.warning("MCP configuration provided but MCP dependencies not available. Install with: pip install mcp")
         
         # Initialize the base chainlet with MCP tool functions
         super().__init__(model, system_prompt, base_url, temperature, max_tokens, timeout, tools=self._mcp_tool_functions)
+    
+    def _run_async_safe(self, coro, timeout=120):
+        """Safely run an async coroutine from sync context."""
+        try:
+            # Try to get the current event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an event loop, we need to run in a thread
+            def run_in_thread():
+                new_loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(new_loop)
+                    return new_loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
+                finally:
+                    new_loop.close()
+                    
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_in_thread)
+                return future.result(timeout=timeout + 5)  # Add buffer for thread overhead
+                
+        except RuntimeError:
+            # No event loop running, we can create one
+            return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
     
     def _load_mcp_config(self, config: Dict[str, Any]) -> None:
         """Load MCP server configurations."""
@@ -94,34 +126,28 @@ class MCPChainlet(OllamaChainlet):
         
         for tool in tools:
             def create_tool_wrapper(tool_ref):
-                def tool_function(**kwargs):
-                    """Generated wrapper function for MCP tool."""
+                def sync_tool_function(**kwargs):
+                    """Generated sync wrapper function for MCP tool."""
                     try:
-                        # Run the async tool call in sync context
-                        import asyncio
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            # If we're already in an async context, use run_coroutine_threadsafe
-                            import concurrent.futures
-                            with concurrent.futures.ThreadPoolExecutor() as executor:
-                                future = executor.submit(asyncio.run, self.mcp_manager.call_tool(tool_ref.name, kwargs))
-                                result = future.result()
-                        else:
-                            # Run directly
-                            result = asyncio.run(self.mcp_manager.call_tool(tool_ref.name, kwargs))
+                        async def call_tool():
+                            if self.mcp_manager is None:
+                                return "Error: MCP manager not available"
+                            result = await self.mcp_manager.call_tool(tool_ref.name, kwargs)
+                            if result['success']:
+                                return result['result']
+                            else:
+                                return f"Error: {result['error']}"
                         
-                        if result['success']:
-                            return result['result']
-                        else:
-                            return f"Error: {result['error']}"
+                        return self._run_async_safe(call_tool(), timeout=120)
+                            
                     except Exception as e:
                         return f"Tool execution error: {str(e)}"
                 
                 # Set function name and docstring for ollama
-                tool_function.__name__ = tool_ref.name
-                tool_function.__doc__ = tool_ref.description or f"MCP tool: {tool_ref.name}"
+                sync_tool_function.__name__ = tool_ref.name
+                sync_tool_function.__doc__ = tool_ref.description or f"MCP tool: {tool_ref.name}"
                 
-                return tool_function
+                return sync_tool_function
             
             tool_functions.append(create_tool_wrapper(tool))
         
@@ -304,7 +330,7 @@ class MCPChainlet(OllamaChainlet):
             logger.debug(f"Error extracting tool call: {e}")
             return None
     
-    async def _execute_tool_call(self, tool_call: Dict[str, Any]) -> str:
+    def _execute_tool_call(self, tool_call: Dict[str, Any]) -> str:
         """Execute a tool call and return the result."""
         tool_name = tool_call.get('name')
         arguments = tool_call.get('arguments', {})
@@ -313,12 +339,17 @@ class MCPChainlet(OllamaChainlet):
             return "Error: Tool call missing 'name' field"
         
         try:
-            result = await self.mcp_manager.call_tool(tool_name, arguments)
+            async def execute_tool():
+                if self.mcp_manager is None:
+                    return "Error: MCP manager not available"
+                result = await self.mcp_manager.call_tool(tool_name, arguments)
+                
+                if result['success']:
+                    return f"Tool '{tool_name}' result: {result['result']}"
+                else:
+                    return f"Tool '{tool_name}' error: {result['error']}"
             
-            if result['success']:
-                return f"Tool '{tool_name}' result: {result['result']}"
-            else:
-                return f"Tool '{tool_name}' error: {result['error']}"
+            return self._run_async_safe(execute_tool(), timeout=120)
         
         except Exception as e:
             return f"Tool execution error: {str(e)}"
@@ -352,7 +383,7 @@ class MCPChainlet(OllamaChainlet):
         
         return enhanced_messages
     
-    async def generate(self, user_message: Optional[str] = None) -> str:
+    def generate(self, user_message: Optional[str] = None) -> str:
         """
         Generate a response with MCP tool support.
         
@@ -367,8 +398,13 @@ class MCPChainlet(OllamaChainlet):
         # Initialize MCP if not already done
         if self._mcp_enabled and not self._tools_context:
             logger.debug("Initializing MCP...")
-            await self._initialize_mcp()
-            logger.debug(f"MCP initialized. Tools context length: {len(self._tools_context)}")
+            try:
+                self._run_async_safe(self._initialize_mcp(), timeout=60)
+                logger.debug(f"MCP initialized. Tools context length: {len(self._tools_context)}")
+            except Exception as e:
+                logger.error(f"Failed to initialize MCP: {e}")
+                # Continue without MCP functionality
+                self._mcp_enabled = False
         
         try:
             # For gpt-oss models, just use the parent's generate method 
@@ -376,7 +412,7 @@ class MCPChainlet(OllamaChainlet):
             is_gpt_oss = 'gpt-oss' in self.model.lower()
             if is_gpt_oss:
                 logger.debug("Using parent generate for gpt-oss model")
-                return await asyncio.to_thread(super().generate, user_message)
+                return super().generate(user_message)
             
             # For other models, keep the original MCP logic with text-based tool calling
             logger.debug("Using legacy MCP tool calling logic")
@@ -394,7 +430,7 @@ class MCPChainlet(OllamaChainlet):
             
             try:
                 # Generate response using parent class
-                response = await asyncio.to_thread(super().generate)
+                response = super().generate()
                 
                 # Restore original messages
                 self.messages = original_messages
@@ -403,14 +439,11 @@ class MCPChainlet(OllamaChainlet):
                 tool_call = self._extract_tool_call(response)
                 
                 if tool_call:
-                    # Execute the tool call with timeout
+                    # Execute the tool call using the safe async runner
                     try:
-                        tool_result = await asyncio.wait_for(
-                            self._execute_tool_call(tool_call), 
-                            timeout=120
-                        )
-                    except asyncio.TimeoutError:
-                        tool_result = "Tool execution timed out"
+                        tool_result = self._execute_tool_call(tool_call)
+                    except Exception as e:
+                        tool_result = f"Tool execution error: {str(e)}"
                     
                     # Add tool result and generate follow-up
                     self.add_user_message(f"Tool result: {tool_result}")
@@ -418,7 +451,7 @@ class MCPChainlet(OllamaChainlet):
                     self.messages = enhanced_messages
                     
                     try:
-                        follow_up = await asyncio.to_thread(super().generate)
+                        follow_up = super().generate()
                         return follow_up
                     finally:
                         self.messages = original_messages
@@ -433,9 +466,9 @@ class MCPChainlet(OllamaChainlet):
         except Exception as e:
             logger.error(f"Error in MCPChainlet.generate: {e}", exc_info=True)
             # Fallback to basic generation
-            return await asyncio.to_thread(super().generate, user_message)
+            return super().generate(user_message)
     
-    async def generate_stream(self, user_message: Optional[str] = None) -> Iterator[str]:
+    def generate_stream(self, user_message: Optional[str] = None) -> Iterator[str]:
         """
         Generate a streaming response with MCP tool support.
         
@@ -447,7 +480,10 @@ class MCPChainlet(OllamaChainlet):
         """
         # Initialize MCP if not already done
         if self._mcp_enabled and not self._tools_context:
-            await self._initialize_mcp()
+            try:
+                self._run_async_safe(self._initialize_mcp(), timeout=60)
+            except Exception as e:
+                logger.error(f"Failed to initialize MCP in streaming: {e}")
         
         try:
             # For gpt-oss models, just use the parent's generate_stream method 
@@ -459,7 +495,7 @@ class MCPChainlet(OllamaChainlet):
                     yield chunk
                 return
             
-            # For other models, keep the original MCP logic
+            # For other models, keep the original MCP logic (simplified for sync)
             original_messages = self.messages
             enhanced_messages = self._create_enhanced_messages()
             
@@ -481,14 +517,11 @@ class MCPChainlet(OllamaChainlet):
             # Check if the complete response contains a tool call (legacy approach)
             tool_call = self._extract_tool_call(full_response)
             if tool_call:
-                # Execute the tool call with timeout
+                # Execute the tool call using the safe async runner
                 try:
-                    tool_result = await asyncio.wait_for(
-                        self._execute_tool_call(tool_call), 
-                        timeout=120
-                    )
-                except asyncio.TimeoutError:
-                    tool_result = "Tool execution timed out"
+                    tool_result = self._execute_tool_call(tool_call)
+                except Exception as e:
+                    tool_result = f"Tool execution error: {str(e)}"
                 
                 # Add tool result and generate follow-up
                 self.add_user_message(f"Tool result: {tool_result}")
@@ -508,12 +541,21 @@ class MCPChainlet(OllamaChainlet):
         except Exception as e:
             logger.error(f"Error in streaming generate: {e}")
             # Ensure original messages are restored on error
-            if 'original_messages' in locals():
-                self.messages = original_messages
+            try:
+                # Check if original_messages exists in the local scope before trying to use it
+                if 'original_messages' in locals() and hasattr(self, 'messages'):
+                    self.messages = locals()['original_messages']
+                elif hasattr(self, 'messages') and self.messages:
+                    # Fallback: keep current messages as they are
+                    pass
+            except Exception as restore_error:
+                logger.debug(f"Error restoring messages: {restore_error}")
             raise
     
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Get list of available MCP tools."""
+        if self.mcp_manager is None:
+            return []
         return [tool.to_dict() for tool in self.mcp_manager.get_all_tools()]
     
     def is_mcp_enabled(self) -> bool:
@@ -531,7 +573,10 @@ class MCPChainlet(OllamaChainlet):
             self.messages = original_messages
             return False
     
-    async def refresh_tools(self) -> None:
+    def refresh_tools(self) -> None:
         """Refresh tool discovery from all servers."""
         if self._mcp_enabled:
-            await self._initialize_mcp()
+            try:
+                self._run_async_safe(self._initialize_mcp(), timeout=60)
+            except Exception as e:
+                logger.error(f"Failed to refresh MCP tools: {e}")
