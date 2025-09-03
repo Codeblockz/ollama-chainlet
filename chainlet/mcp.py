@@ -10,16 +10,23 @@ import logging
 import asyncio
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamablehttp_client
     import mcp.types as types
+    MCP_AVAILABLE = True
 except ImportError as e:
-    print(f"Warning: MCP dependencies not found: {e}")
-    # Provide fallback classes/functions
+    MCP_AVAILABLE = False
+    MCP_IMPORT_ERROR = str(e)
+    
+    # Update the error class with specific message
+    def _create_mcp_error(operation=""):
+        return MCPNotAvailableError(f"MCP dependencies not available: {MCP_IMPORT_ERROR}. "
+                           f"Install with: pip install mcp{f' (attempted: {operation})' if operation else ''}")
+    
     ClientSession = None
     StdioServerParameters = None
     stdio_client = None
@@ -28,6 +35,11 @@ except ImportError as e:
 
 
 logger = logging.getLogger(__name__)
+
+
+class MCPNotAvailableError(ImportError):
+    """Raised when MCP dependencies are not available."""
+    pass
 
 
 @dataclass
@@ -65,15 +77,16 @@ class MCPClient:
     """Wrapper around MCP SDK client for standardized operations."""
     
     def __init__(self, config: MCPServerConfig):
+        if not MCP_AVAILABLE:
+            raise _create_mcp_error("MCPClient initialization")
+        
         self.config = config
         self._session = None
         self._tools: List[MCPTool] = []
         self._connected = False
         self._connection_lock = asyncio.Lock()
-        self._read = None
-        self._write = None
+        self._exit_stack = None
         self._last_used = 0
-        import time
         self._connection_timeout = 300  # 5 minutes
     
     async def _ensure_connection(self):
@@ -88,68 +101,69 @@ class MCPClient:
                 self._last_used = current_time
                 return self._session
             
-            # Clean up old connection
-            if self._session:
-                try:
-                    # Don't await, just close
-                    self._session = None
-                    self._connected = False
-                except:
-                    pass
+            # Clean up old connection properly
+            await self._cleanup_connection()
             
-            # Create new connection
+            # Create new connection using AsyncExitStack
             try:
+                self._exit_stack = AsyncExitStack()
+                
                 if self.config.transport == "stdio":
-                    if StdioServerParameters is None:
-                        raise RuntimeError("MCP dependencies not available")
+                    if not stdio_client or not StdioServerParameters:
+                        raise _create_mcp_error("stdio client setup")
+                    if not self.config.command:
+                        raise ValueError("stdio transport requires command")
+                        
                     server_params = StdioServerParameters(
                         command=self.config.command,
                         args=self.config.args or [],
                         env=self.config.env or {}
                     )
-                    if stdio_client is None or ClientSession is None:
-                        raise RuntimeError("MCP dependencies not available")
                     
-                    # Store connection details for reuse
-                    if not self._read or not self._write:
-                        self._stdio_context = stdio_client(server_params)
-                        self._read, self._write = await self._stdio_context.__aenter__()
+                    # Use AsyncExitStack for proper resource management
+                    read, write = await self._exit_stack.enter_async_context(
+                        stdio_client(server_params)
+                    )
                     
-                    session = ClientSession(self._read, self._write)
-                    await session.initialize()
-                    self._session = session
-                    self._connected = True
-                    self._last_used = current_time
-                
                 elif self.config.transport == "http":
-                    if streamablehttp_client is None or ClientSession is None:
-                        raise RuntimeError("MCP dependencies not available")
+                    if not streamablehttp_client:
+                        raise _create_mcp_error("http client setup")
+                    if not self.config.url:
+                        raise ValueError("http transport requires url")
+                        
+                    # Use AsyncExitStack for proper resource management
+                    read, write, _ = await self._exit_stack.enter_async_context(
+                        streamablehttp_client(self.config.url)
+                    )
                     
-                    if not self._read or not self._write:
-                        self._http_context = streamablehttp_client(self.config.url)
-                        self._read, self._write, _ = await self._http_context.__aenter__()
-                    
-                    session = ClientSession(self._read, self._write)
-                    await session.initialize()
-                    self._session = session
-                    self._connected = True
-                    self._last_used = current_time
                 else:
                     raise ValueError(f"Unsupported transport: {self.config.transport}")
+                
+                # Initialize the session
+                if not ClientSession:
+                    raise _create_mcp_error("session initialization")
+                session = ClientSession(read, write)
+                await session.initialize()
+                self._session = session
+                self._connected = True
+                self._last_used = current_time
                 
                 return self._session
                 
             except Exception as e:
                 logger.error(f"Failed to connect to MCP server {self.config.name}: {e}")
-                self._session = None
-                self._connected = False
+                await self._cleanup_connection()
                 raise
     
     @asynccontextmanager
     async def connect(self):
-        """Connect to the MCP server and yield the session (legacy method)."""
-        session = await self._ensure_connection()
-        yield session
+        """Connect to the MCP server and yield the session."""
+        try:
+            session = await self._ensure_connection()
+            yield session
+        finally:
+            # Connection cleanup is handled by the connection manager
+            pass
     
     async def discover_tools(self) -> List[MCPTool]:
         """Discover available tools from the server."""
@@ -173,54 +187,96 @@ class MCPClient:
             logger.error(f"Failed to discover tools from {self.config.name}: {e}")
             return []
     
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool and return the result."""
+    async def _cleanup_connection(self):
+        """Properly clean up connection resources."""
         try:
-            session = await self._ensure_connection()
-            
-            # Add timeout for tool calls
-            result = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments),
-                timeout=60  # 1 minute timeout for tool calls
-            )
-            
-            # Handle different content types
-            if result.content:
-                content_block = result.content[0]
-                if types and hasattr(types, 'TextContent') and isinstance(content_block, types.TextContent):
-                    return {
-                        "success": True,
-                        "result": content_block.text,
-                        "structured": result.structuredContent
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "result": str(content_block),
-                        "structured": result.structuredContent
-                    }
-            
-            return {
-                "success": True,
-                "result": "Tool executed successfully",
-                "structured": result.structuredContent
-            }
-        
-        except asyncio.TimeoutError:
-            logger.error(f"Tool call {tool_name} timed out")
-            return {
-                "success": False,
-                "error": f"Tool call timed out after 60 seconds"
-            }
+            if self._exit_stack:
+                try:
+                    await self._exit_stack.aclose()
+                except Exception as e:
+                    logger.debug(f"Error cleaning up exit stack: {e}")
+                finally:
+                    self._exit_stack = None
         except Exception as e:
-            logger.error(f"Failed to call tool {tool_name}: {e}")
-            # Reset connection on error
+            logger.debug(f"Error in connection cleanup: {e}")
+        finally:
             self._session = None
             self._connected = False
-            return {
-                "success": False,
-                "error": str(e)
-            }
+    
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Call a tool and return the result."""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                session = await self._ensure_connection()
+                
+                # Add timeout for tool calls
+                result = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments),
+                    timeout=60  # 1 minute timeout for tool calls
+                )
+                
+                # Handle different content types
+                if result.content:
+                    content_block = result.content[0]
+                    if types and hasattr(types, 'TextContent') and isinstance(content_block, types.TextContent):
+                        return {
+                            "success": True,
+                            "result": content_block.text,
+                            "structured": getattr(result, 'structuredContent', None)
+                        }
+                    else:
+                        return {
+                            "success": True,
+                            "result": str(content_block),
+                            "structured": getattr(result, 'structuredContent', None)
+                        }
+                
+                return {
+                    "success": True,
+                    "result": "Tool executed successfully",
+                    "structured": getattr(result, 'structuredContent', None)
+                }
+            
+            except asyncio.TimeoutError:
+                logger.error(f"Tool call {tool_name} timed out")
+                return {
+                    "success": False,
+                    "error": f"Tool call timed out after 60 seconds"
+                }
+            except ConnectionError as e:
+                logger.error(f"Connection error calling tool {tool_name}: {e}")
+                await self._cleanup_connection()
+                
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying tool call {tool_name} due to connection error (attempt {attempt + 2}/{max_retries})")
+                    continue
+                
+                return {
+                    "success": False,
+                    "error": f"Connection error: {str(e)}"
+                }
+            except Exception as e:
+                logger.error(f"Failed to call tool {tool_name}: {e}")
+                
+                # Clean up connection on error and retry once
+                await self._cleanup_connection()
+                
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying tool call {tool_name} (attempt {attempt + 2}/{max_retries})")
+                    continue
+                
+                return {
+                    "success": False,
+                    "error": str(e)
+                }
+        
+        # Fallback return (should never be reached)
+        return {
+            "success": False,
+            "error": "Tool call failed after all retries"
+        }
     
     def get_tools(self) -> List[MCPTool]:
         """Get cached tools list."""
@@ -236,6 +292,9 @@ class MCPManager:
     """Manages multiple MCP server connections and tool operations."""
     
     def __init__(self):
+        if not MCP_AVAILABLE:
+            raise _create_mcp_error("MCPManager initialization")
+        
         self._clients: Dict[str, MCPClient] = {}
         self._all_tools: Dict[str, MCPTool] = {}
         self._server_for_tool: Dict[str, str] = {}
@@ -291,6 +350,8 @@ class MCPManager:
         # Aggregate results
         for result in results:
             if isinstance(result, Exception):
+                continue
+            if not isinstance(result, list):
                 continue
             for tool_name, tool, server_name in result:
                 self._all_tools[tool_name] = tool
@@ -379,9 +440,9 @@ class MCPManager:
     
     async def cleanup(self) -> None:
         """Clean up all client connections."""
+        cleanup_tasks = []
         for client in self._clients.values():
-            try:
-                client._session = None
-                client._connected = False
-            except Exception as e:
-                logger.error(f"Error cleaning up client: {e}")
+            cleanup_tasks.append(client._cleanup_connection())
+        
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
